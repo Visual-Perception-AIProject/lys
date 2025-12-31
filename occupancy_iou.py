@@ -1,7 +1,6 @@
 import json
 import os
 import re
-from collections import deque
 
 # ==========================================
 # 1. 경로 및 파라미터
@@ -11,13 +10,14 @@ ROI_PATH = os.path.join(BASE_DIR, "roi", "seats.json")
 DETECTION_DIR = os.path.join(BASE_DIR, "json_results")
 
 IOU_THRESHOLD = 0.03
-WINDOW_SIZE = 5
-MIN_OCC_FRAMES = 2
+
+FPS = 30                  # 영상 FPS (필요 시 조정)
+OCCUPY_SECONDS = 3        # "몇 초 이상 앉아 있으면 점유"
+OCCUPY_FRAMES = FPS * OCCUPY_SECONDS
 
 # ==========================================
 # 2. 유틸 함수
 # ==========================================
-
 def bbox_to_list(b):
     return [b["x1"], b["y1"], b["x2"], b["y2"]]
 
@@ -35,10 +35,12 @@ def iou(boxA, boxB):
     return inter / union if union > 0 else 0
 
 def is_occupied(roi_bbox, person_boxes):
+    """IoU + foot-point 기반"""
     for p in person_boxes:
         if iou(roi_bbox, p) >= IOU_THRESHOLD:
             return True
 
+        # foot-point
         foot_x = (p[0] + p[2]) / 2
         foot_y = p[3]
         if roi_bbox[0] <= foot_x <= roi_bbox[2] and roi_bbox[1] <= foot_y <= roi_bbox[3]:
@@ -52,7 +54,6 @@ def extract_frame_idx(name):
 # ==========================================
 # 3. 메인 로직
 # ==========================================
-
 def main():
     # ---------- seats.json 로딩 ----------
     print(f"📌 ROI_PATH: {ROI_PATH}")
@@ -64,23 +65,16 @@ def main():
     with open(ROI_PATH, "r", encoding="utf-8-sig") as f:
         data = json.load(f)
 
-    print(f"📌 JSON type: {type(data)}")
-    print(f"📌 Tables in JSON: {len(data)}")
-
     tables = []
     table_seats = {}
 
-    # ---------- Table / Seat 파싱 ----------
     for t in data:
-        table_id = t.get("id")
-        table_bbox = bbox_to_list(t["bbox"])
-
+        tid = t["id"]
         tables.append({
-            "id": table_id,
-            "bbox": table_bbox
+            "id": tid,
+            "bbox": bbox_to_list(t["bbox"])
         })
-
-        table_seats[table_id] = [
+        table_seats[tid] = [
             bbox_to_list(s["bbox"])
             for s in t.get("seats", [])
         ]
@@ -88,13 +82,16 @@ def main():
     print(f"✅ Loaded Tables: {len(tables)}")
     print(f"✅ Loaded Seats : {sum(len(v) for v in table_seats.values())}")
 
-    if len(tables) == 0:
+    if not tables:
         print("❌ 테이블 로드 실패")
         return
 
-    # ---------- Temporal buffer ----------
-    history = {
-        t["id"]: deque(maxlen=WINDOW_SIZE)
+    # ---------- 시간축 상태 초기화 ----------
+    table_states = {
+        t["id"]: {
+            "occupied_frames": 0,
+            "status": "empty"   # empty | candidate | occupied
+        }
         for t in tables
     }
 
@@ -105,7 +102,7 @@ def main():
     )
 
     print(f"📂 Total Frames: {len(files)}")
-    print("=== Table Occupancy (Seat-based) ===")
+    print("=== Table Occupancy (Temporal-based) ===")
 
     for fname in files:
         with open(os.path.join(DETECTION_DIR, fname), "r", encoding="utf-8") as f:
@@ -117,11 +114,12 @@ def main():
             if d.get("class") == "person"
         ]
 
-        occupied = 0
         print(f"\n[{fname}] persons={len(persons)}")
+        occupied_cnt = 0
 
         for t in tables:
             tid = t["id"]
+            state = table_states[tid]
 
             table_occ = is_occupied(t["bbox"], persons)
             seat_occ = any(
@@ -129,18 +127,28 @@ def main():
                 for seat_bbox in table_seats.get(tid, [])
             )
 
-            occ = table_occ or seat_occ
-            history[tid].append(1 if occ else 0)
+            overlapped = table_occ or seat_occ
 
-            final_occ = sum(history[tid]) >= MIN_OCC_FRAMES
-            status = "Occupied" if final_occ else "Free"
+            if overlapped:
+                state["occupied_frames"] += 1
 
-            print(f"  {tid}: {status}")
+                if state["occupied_frames"] >= OCCUPY_FRAMES:
+                    state["status"] = "occupied"
+                else:
+                    state["status"] = "candidate"
+            else:
+                state["occupied_frames"] = 0
+                state["status"] = "empty"
 
-            if final_occ:
-                occupied += 1
+            if state["status"] == "occupied":
+                occupied_cnt += 1
 
-        print(f"➡️ Occupancy: {occupied}/{len(tables)}")
+            print(
+                f"  {tid}: {state['status']} "
+                f"({state['occupied_frames']}/{OCCUPY_FRAMES})"
+            )
+
+        print(f"➡️ Occupancy: {occupied_cnt}/{len(tables)}")
 
 # ==========================================
 if __name__ == "__main__":
